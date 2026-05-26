@@ -1,0 +1,631 @@
+/* USER CODE BEGIN Header */
+/* USER CODE END Header */
+/* Includes */
+#include "main.h"
+/* Private includes */
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+/* USER CODE END Includes */
+/* Private define */
+/* USER CODE BEGIN PD */
+#define TS         100e-6f
+#define RS         16.0f
+#define LQ         0.018f
+#define NP         18.0f
+#define VMAX_MPC   430.0f
+#define ALPHA_DC   0.995f  // Filtro do Estimador
+#define ALPHA_REF  0.995f  // Filtro de Referência de Velocidade
+#define M_PI_F     3.14159265f
+#define IMAX_MPC   7.0f
+#define WMAX_MPC   100.0f
+/* USER CODE END PD */
+/* Private variables */
+COM_InitTypeDef BspCOMInit;
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+CORDIC_HandleTypeDef hcordic;
+CRC_HandleTypeDef hcrc;
+DAC_HandleTypeDef hdac1;
+DAC_HandleTypeDef hdac2;
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim6;
+/* USER CODE BEGIN PV */
+uint32_t vetor_adc_bruto[6];
+uint32_t saidas_dac[2] = {0, 0};
+// Matrizes do Controlador Preditivo
+const float KX[2][3] = {{ 0.000186258f,  0.00159592f,   0.000927727f },
+                        { 0.293384f,     7.93768f,     -0.00149181f }};
+const float KZ[2][2] = {{ 0.000464154f,  0.000903995f },
+                        {-0.000312289f,  5.42984f }};
+const float KR[2][2] = {{ 0.000928308f,  0.00182713f },
+                        {-0.000624578f,  8.98341f }};
+// Variáveis de Estado do Controle
+float z_int_we   = 0.0f;
+float z_int_id   = 0.0f;
+float wm_ref_f   = 0.0f;
+float vq_ref_ant = 0.0f;
+float vd_ref_ant = 0.0f;
+// Variáveis de Leitura da HIL (Live Watch)
+float hil_w_med, hil_theta_e, hil_wref, hil_ia, hil_ib, hil_ic;
+/* USER CODE END PV */
+/* Private function prototypes */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_DAC1_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_CORDIC_Init(void);
+static void MX_CRC_Init(void);
+static void MX_DAC2_Init(void);
+/* USER CODE BEGIN PFP */
+// Funções Auxiliares
+void Leitura_Sensores_HIL(void);
+void CORDIC_ConfiguraInicial(void);
+void CORDIC_Calcula_Seno_Cosseno(float angulo_rad, float *seno, float *cosseno);
+void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac);
+void Inicializa_DAC2_Manual(void);
+/* USER CODE END PFP */
+int main(void){
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_TIM1_Init();
+  MX_ADC1_Init();
+  MX_DAC1_Init();
+  MX_TIM6_Init();
+  MX_CORDIC_Init();
+  MX_CRC_Init();
+  MX_DAC2_Init();
+  /* USER CODE BEGIN 2 */
+  __HAL_RCC_CORDIC_CLK_ENABLE();
+  CORDIC_ConfiguraInicial();
+  // FORÇA O TIMER 6 A RODAR EM 10 kHz (Janela de 100us)
+  __HAL_TIM_SET_PRESCALER(&htim6, 170 - 1);
+  __HAL_TIM_SET_AUTORELOAD(&htim6, 100 - 1);
+  // CALIBRAGEM DO ADC
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  // INICIALIZAÇÃO DE SAÍDAS (DACs)
+  Inicializa_DAC2_Manual();
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1); // Pino PA4
+  HAL_DAC_Start(&hdac2, DAC_CHANNEL_1); // Pino PA6
+  // LIGA A INTERRUPÇÃO DO DMA E O ADC
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+//  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)vetor_adc_bruto, 6);
+  // O "PLAY" NO SISTEMA (Timer começa a gerar TRGO)
+  HAL_TIM_Base_Start_IT(&htim6);
+  /* USER CODE END 2 */
+while (1){
+  }
+}
+void SystemClock_Config(void){
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK){
+    Error_Handler();
+  }
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)  {
+    Error_Handler();
+  }
+}
+static void MX_ADC1_Init(void)
+{
+  /* USER CODE BEGIN ADC1_Init 0 */
+  /* USER CODE END ADC1_Init 0 */
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+  /* USER CODE BEGIN ADC1_Init 1 */
+  /* USER CODE END ADC1_Init 1 */
+  /** Common config */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 6;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure the ADC multi-mode */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Rank = ADC_REGULAR_RANK_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /** Configure Regular Channel */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = ADC_REGULAR_RANK_6;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+  /* USER CODE END ADC1_Init 2 */
+}
+static void MX_CORDIC_Init(void){
+  /* USER CODE BEGIN CORDIC_Init 0 */
+  /* USER CODE END CORDIC_Init 0 */
+  /* USER CODE BEGIN CORDIC_Init 1 */
+  /* USER CODE END CORDIC_Init 1 */
+  hcordic.Instance = CORDIC;
+  if (HAL_CORDIC_Init(&hcordic) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CORDIC_Init 2 */
+  /* USER CODE END CORDIC_Init 2 */
+}
+static void MX_CRC_Init(void){
+  /* USER CODE BEGIN CRC_Init 0 */
+  /* USER CODE END CRC_Init 0 */
+  /* USER CODE BEGIN CRC_Init 1 */
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+  /* USER CODE END CRC_Init 2 */
+}
+static void MX_DAC1_Init(void){
+  /* USER CODE BEGIN DAC1_Init 0 */
+  /* USER CODE END DAC1_Init 0 */
+  DAC_ChannelConfTypeDef sConfig = {0};
+  /* USER CODE BEGIN DAC1_Init 1 */
+  /* USER CODE END DAC1_Init 1 */
+  /** DAC Initialization */
+  hdac1.Instance = DAC1;
+  if (HAL_DAC_Init(&hdac1) != HAL_OK){
+    Error_Handler();
+  }
+  /** DAC channel OUT1 config */
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+  sConfig.DAC_DMADoubleDataMode = DISABLE;
+  sConfig.DAC_SignedFormat = DISABLE;
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_Trigger2 = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC1_Init 2 */
+  /* USER CODE END DAC1_Init 2 */
+}
+static void MX_DAC2_Init(void){
+  /* USER CODE BEGIN DAC2_Init 0 */
+  /* USER CODE END DAC2_Init 0 */
+  DAC_ChannelConfTypeDef sConfig = {0};
+  /* USER CODE BEGIN DAC2_Init 1 */
+  /* USER CODE END DAC2_Init 1 */
+  /** DAC Initialization */
+  hdac2.Instance = DAC2;
+  if (HAL_DAC_Init(&hdac2) != HAL_OK){
+    Error_Handler();
+  }
+  /** DAC channel OUT1 config */
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+  sConfig.DAC_DMADoubleDataMode = DISABLE;
+  sConfig.DAC_SignedFormat = DISABLE;
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_Trigger2 = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac2, &sConfig, DAC_CHANNEL_1) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC2_Init 2 */
+  /* USER CODE END DAC2_Init 2 */
+}
+static void MX_TIM1_Init(void){
+  /* USER CODE BEGIN TIM1_Init 0 */
+  /* USER CODE END TIM1_Init 0 */
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+  /* USER CODE BEGIN TIM1_Init 1 */
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 17 - 1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV4;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK){
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK){
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK){
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK){
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK){
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 85;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+}
+static void MX_TIM6_Init(void){
+  /* USER CODE BEGIN TIM6_Init 0 */
+  /* USER CODE END TIM6_Init 0 */
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  /* USER CODE BEGIN TIM6_Init 1 */
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 170 - 1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 99;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK){
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK){
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+  // Ligar o NVIC aqui, DENTRO da inicialização do Timer
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  /* USER CODE END TIM6_Init 2 */
+}
+static void MX_DMA_Init(void){
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+}
+static void MX_GPIO_Init(void){
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+    // Garante que o pino inicie em nível lógico baixo (desligado)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+    // Configuração do LED
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP; // Saída Push-Pull
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW; // Baixa velocidade (é só um LED)
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	// CONFIGURAÇÃO DO PINO DE TESTE DE TEMPO (PB15)
+	GPIO_InitStruct.Pin = GPIO_PIN_15;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH; // Alta velocidade para não gerar atraso na borda
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+	// Configuração do pino de Start da Typhoon
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN; // Forca a ler 0 se o cabo da Typhoon for desconectado
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+/* USER CODE BEGIN 4 */
+// FUNÇÕES CORDIC
+void CORDIC_ConfiguraInicial(void){
+    hcordic.Instance = CORDIC;
+    HAL_CORDIC_Init(&hcordic);
+    CORDIC_ConfigTypeDef sConfig = {0};
+    sConfig.Function = CORDIC_FUNCTION_COSINE;
+    sConfig.Precision = CORDIC_PRECISION_6CYCLES;
+    sConfig.Scale = CORDIC_SCALE_0;
+    sConfig.NbWrite = CORDIC_NBWRITE_1;
+    sConfig.NbRead = CORDIC_NBREAD_2;
+    sConfig.InSize = CORDIC_INSIZE_32BITS;
+    sConfig.OutSize = CORDIC_OUTSIZE_32BITS;
+    HAL_CORDIC_Configure(&hcordic, &sConfig);
+}
+void CORDIC_Calcula_Seno_Cosseno(float angulo_rad, float *seno, float *cosseno){
+    // Proteção de limites antes da conversão para ponto fixo
+    if (angulo_rad > M_PI_F) angulo_rad -= 2.0f * M_PI_F;
+    if (angulo_rad < -M_PI_F) angulo_rad += 2.0f * M_PI_F;
+    int32_t angulo_q31 = (int32_t)((angulo_rad / 3.14159265f) * 2147483647.0f);
+    int32_t resultados_q31[2] = {0, 0};
+    HAL_CORDIC_Calculate(&hcordic, &angulo_q31, resultados_q31, 1, 10);
+    *cosseno = (float)resultados_q31[0] / 2147483647.0f;
+    *seno    = (float)resultados_q31[1] / 2147483647.0f;
+}
+
+// LEITURA DOS SENSORES (TYPHOON -> STM32)
+void Leitura_Sensores_HIL(void){
+    extern uint32_t vetor_adc_bruto[6];
+    float v_pino;
+    v_pino = ((float)vetor_adc_bruto[0] / 4095.0f) * 3.3f;
+    hil_w_med = (v_pino - 1.65f) * 60.606060f;
+    v_pino = ((float)vetor_adc_bruto[1] / 4095.0f) * 3.3f;
+    hil_theta_e = (v_pino) * 1.90303f;
+    v_pino = ((float)vetor_adc_bruto[2] / 4095.0f) * 3.3f;
+    hil_wref = (v_pino - 1.65f) * 60.606060f;
+    v_pino = ((float)vetor_adc_bruto[3] / 4095.0f) * 3.3f;
+    hil_ia = (v_pino - 1.65f) * 4.24242424f;
+    v_pino = ((float)vetor_adc_bruto[4] / 4095.0f) * 3.3f;
+    hil_ib = (v_pino - 1.65f) * 4.24242424f;
+    v_pino = ((float)vetor_adc_bruto[5] / 4095.0f) * 3.3f;
+    hil_ic = (v_pino - 1.65f) * 4.24242424f;
+}
+
+// ATUALIZAÇÃO DOS SINAIS DAC
+void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac){
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, vetor_valores_dac[0]);
+    HAL_DAC_SetValue(&hdac2, DAC_CHANNEL_1, DAC_ALIGN_12B_R, vetor_valores_dac[1]);
+}
+
+// ==============================================================================
+// 1. LIGA O PINO NO EXATO MOMENTO EM QUE O TIMER MANDA O ADC INICIAR A LEITURA
+// ==============================================================================
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM6) {
+        // O ADC e o DMA começam a trabalhar fisicamente neste milissegundo
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+        // 2. DISPARA O ADC E O DMA MANUALMENTE
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t*)vetor_adc_bruto, 6);
+    }
+}
+
+// LOOP DE CONTROLE PRINCIPAL (10 kHz via DMA ADC)
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if(hadc->Instance == ADC1) {
+
+        // ==============================================================================
+        // 2. DESLIGA O PINO IMEDIATAMENTE (O DMA terminou de preencher o vetor bruto)
+        // ==============================================================================
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+
+        // Verifica o sinal de "Start" do SCADA da Typhoon no Pino PC13
+        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
+            // MODO: RODANDO (SIMULAÇÃO ATIVA)
+            // 1. LED Heartbeat Lento (Pisca a cada 500ms = 5000 ciclos)
+            static uint32_t contador_led_run = 0;
+            contador_led_run++;
+            if(contador_led_run >= 5000) {
+                HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                contador_led_run = 0;
+            }
+            // 2. Leituras
+            Leitura_Sensores_HIL();
+            float ia_med = hil_ia;
+            float ib_med = hil_ib;
+            // 3. Perfil de Referência e Filtro
+            wm_ref_f = ALPHA_REF * wm_ref_f + (1.0f - ALPHA_REF) * hil_wref;
+            float we_ref_f = NP * wm_ref_f;
+            float we_feedback = hil_w_med * NP;
+            float theta_feedback = hil_theta_e;
+            // Tratamento trigonométrico do ângulo
+            if (theta_feedback > M_PI_F) theta_feedback -= 2.0f * M_PI_F;
+            if (theta_feedback < -M_PI_F) theta_feedback += 2.0f * M_PI_F;
+            // 4. Transformadas e CORDIC
+            float cos_th, sin_th;
+            CORDIC_Calcula_Seno_Cosseno(theta_feedback, &sin_th, &cos_th);
+            float i_alpha = ia_med;
+            float i_beta  = -(ia_med + 2.0f * ib_med) / 1.7320508f;
+            float iqx =  i_alpha * cos_th - i_beta * sin_th;
+            float idx =  i_alpha * sin_th + i_beta * cos_th;
+            float id = idx;
+            float iq = iqx;
+            // 5. Integração
+            float erro_we = we_ref_f - we_feedback;
+            z_int_we += erro_we;
+            z_int_id += (0.0f - id);
+            // 6. Equações de Ganho do MPC
+            float u_mpc_q = -(KX[0][0]*iq + KX[0][1]*id + KX[0][2]*we_feedback)
+                            + KZ[0][0]*z_int_we + KZ[0][1]*z_int_id
+                            + KR[0][0]*we_ref_f;
+            float u_mpc_d = -(KX[1][0]*iq + KX[1][1]*id + KX[1][2]*we_feedback)
+                            + KZ[1][0]*z_int_we + KZ[1][1]*z_int_id
+                            + KR[1][0]*we_ref_f;
+            // 7. Saturação com Anti-Windup (Back-calculation)
+            float vq_refx = u_mpc_q;
+            float vd_refx = u_mpc_d;
+            if (vq_refx > VMAX_MPC){
+                vq_refx = VMAX_MPC;
+                z_int_we -= erro_we;
+                z_int_id -= -id;
+            } else if (vq_refx < -VMAX_MPC){
+                vq_refx = -VMAX_MPC;
+                z_int_we -= erro_we;
+                z_int_id -= -id;
+            }
+            if (vd_refx > VMAX_MPC){
+                vd_refx = VMAX_MPC;
+                z_int_we -= erro_we;
+                z_int_id -= -id;
+            } else if (vd_refx < -VMAX_MPC){
+                vd_refx = -VMAX_MPC;
+                z_int_we -= erro_we;
+                z_int_id -= -id;
+            }
+            float vq_ref = vq_refx;
+            float vd_ref = vd_refx;
+            vq_ref_ant = vq_ref;
+            vd_ref_ant = vd_ref;
+            // 8. Transformada Inversa e Exportação
+            float valpha_ref = vq_ref * cos_th + vd_ref * sin_th;
+            float vbeta_ref  = -vq_ref * sin_th + vd_ref * cos_th;
+            float valfa_norm = valpha_ref / VMAX_MPC;
+            float vbeta_norm = vbeta_ref  / VMAX_MPC;
+            uint32_t dac_valfa = (uint32_t)(2048.0f + (valfa_norm * 2047.0f));
+            uint32_t dac_vbeta = (uint32_t)(2048.0f + (vbeta_norm * 2047.0f));
+            if(dac_valfa > 4095) dac_valfa = 4095;
+            if(dac_vbeta > 4095) dac_vbeta = 4095;
+            saidas_dac[0] = dac_valfa;
+            saidas_dac[1] = dac_vbeta;
+            Atualiza_Sinais_DAC(saidas_dac);
+
+        } else {
+            // MODO: ESPERA / PARADO (Sinal PC13 em LOW)
+            // LED Heartbeat Rápido (Pisca a cada 100ms = 1000 ciclos)
+            static uint32_t contador_led_stop = 0;
+            contador_led_stop++;
+            if(contador_led_stop >= 1000) {
+                HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                contador_led_stop = 0;
+            }
+            // Limpeza das Memórias (Reseta os integradores e filtros)
+            z_int_we = 0.0f;
+            z_int_id = 0.0f;
+            wm_ref_f = 0.0f;
+            vq_ref_ant = 0.0f;
+            vd_ref_ant = 0.0f;
+            // Travar as saídas no eixo neutro (1.65V = 2048) -> Inversor com 0V de comando
+            saidas_dac[0] = 2048;
+            saidas_dac[1] = 2048;
+            Atualiza_Sinais_DAC(saidas_dac);
+        }
+    }
+}
+
+//INICIALIZAÇÃO MANUAL DO DAC2//
+void Inicializa_DAC2_Manual(void){
+    __HAL_RCC_DAC2_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    hdac2.Instance = DAC2;
+    HAL_DAC_Init(&hdac2);
+    DAC_ChannelConfTypeDef sConfig = {0};
+    sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+    sConfig.DAC_DMADoubleDataMode = DISABLE;
+    sConfig.DAC_SignedFormat = DISABLE;
+    sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+    sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+    sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+    sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+    sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+    HAL_DAC_ConfigChannel(&hdac2, &sConfig, DAC_CHANNEL_1);
+}
+/* USER CODE END 4 *
+
+void Error_Handler(void){
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1){
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line){
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
