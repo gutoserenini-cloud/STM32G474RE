@@ -1,1 +1,484 @@
+/* USER CODE BEGIN Header */
+/** Firmware TRADICIONAL (Sem CORDIC e Sem DMA) - MALHA FECHADA via POLLING */
+/* USER CODE END Header */
 
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+/* Private define ------------------------------------------------------------*/
+#define TS         100e-6f
+#define RS         16.0f
+#define LQ         0.018f
+#define NP         18.0f
+#define VMAX_MPC   430.0f
+#define ALPHA_DC   0.995f
+#define ALPHA_REF  0.995f
+#define M_PI_F     3.14159265f
+#define IMAX_MPC   7.0f
+#define WMAX_MPC   100.0f
+
+/* Private variables ---------------------------------------------------------*/
+COM_InitTypeDef BspCOMInit;
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+CRC_HandleTypeDef hcrc;
+DAC_HandleTypeDef hdac1;
+DAC_HandleTypeDef hdac2;
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim6;
+
+uint32_t vetor_adc_bruto[6];
+uint32_t saidas_dac[2] = {0, 0};
+
+// Matrizes do Controlador Preditivo
+const float KX[2][3] = {{ 0.000186258f,  0.00159592f,   0.000927727f },
+                        { 0.293384f,     7.93768f,     -0.00149181f }};
+const float KZ[2][2] = {{ 0.000464154f,  0.000903995f },
+                        {-0.000312289f,  5.42984f }};
+const float KR[2][2] = {{ 0.000928308f,  0.00182713f },
+                        {-0.000624578f,  8.98341f }};
+
+// Variáveis de Estado do Controle
+float z_int_we   = 0.0f;
+float z_int_id   = 0.0f;
+float wm_ref_f   = 0.0f;
+float vq_ref_ant = 0.0f;
+float vd_ref_ant = 0.0f;
+
+// Variáveis de Leitura da HIL
+float hil_w_med, hil_ia, hil_ib, hil_ic, hil_theta_e, hil_wref;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_DAC1_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_CRC_Init(void);
+static void MX_DAC2_Init(void);
+
+void Leitura_Sensores_HIL(void);
+void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac);
+void Inicializa_DAC2_Manual(void);
+
+/* ========================================================================== */
+/* ROTINA PRINCIPAL (MAIN)                                                    */
+/* ========================================================================== */
+int main(void){
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_TIM1_Init();
+  MX_ADC1_Init();
+  MX_DAC1_Init();
+  MX_TIM6_Init();
+  MX_CRC_Init();
+  MX_DAC2_Init();
+
+  // TIMER EM 10 kHz (Janela de 100 us)
+  __HAL_TIM_SET_PRESCALER(&htim6, 170 - 1);
+  __HAL_TIM_SET_AUTORELOAD(&htim6, 100 - 1);
+
+  // CALIBRAGEM DO ADC
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+
+  // INICIALIZAÇÃO DE SAÍDAS (DACs)
+  Inicializa_DAC2_Manual();
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+  HAL_DAC_Start(&hdac2, DAC_CHANNEL_1);
+
+  // LIGA O TIMER 6 COM INTERRUPÇÃO
+  HAL_TIM_Base_Start_IT(&htim6);
+
+  while (1){
+  }
+}
+
+/* ========================================================================== */
+/* INTERRUPÇÃO DO TIMER 6 (Tempo Total: Abordagem Tradicional)                */
+/* ========================================================================== */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM6) {
+
+        // ==================================================================
+        // INÍCIO DE TUDO: LIGA O PINO (Marca zero do tempo de CPU)
+        // ==================================================================
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+
+        // 1. AQUISIÇÃO DO ADC (Polling Bare-Metal)
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR | ADC_FLAG_EOC | ADC_FLAG_EOS);
+        HAL_ADC_Start(&hadc1);
+        for (uint8_t i = 0; i < 6; i++) {
+            while(__HAL_ADC_GET_FLAG(&hadc1, ADC_FLAG_EOC) == RESET);
+            vetor_adc_bruto[i] = HAL_ADC_GetValue(&hadc1);
+        }
+
+        // 2. MATEMÁTICA E CONTROLE FOC
+        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
+
+            // Pisca o LED devagar (a cada 500ms) se estiver rodando normal
+            static uint32_t contador_led_run = 0;
+            if(++contador_led_run >= 5000) {
+                HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                contador_led_run = 0;
+            }
+
+            Leitura_Sensores_HIL();
+            float ia_med = hil_ia;
+            float ib_med = hil_ib;
+
+            wm_ref_f = ALPHA_REF * wm_ref_f + (1.0f - ALPHA_REF) * hil_wref;
+            float we_ref_f = NP * wm_ref_f;
+            float we_feedback = hil_w_med * NP;
+            float theta_feedback = hil_theta_e;
+
+            if (theta_feedback > M_PI_F) theta_feedback -= 2.0f * M_PI_F;
+            if (theta_feedback < -M_PI_F) theta_feedback += 2.0f * M_PI_F;
+
+            // Matemática da biblioteca padrão (math.h)
+            float cos_th = cosf(theta_feedback);
+            float sin_th = sinf(theta_feedback);
+
+            float i_alpha = ia_med;
+            float i_beta  = -(ia_med + 2.0f * ib_med) / 1.7320508f;
+            float iqx =  i_alpha * cos_th - i_beta * sin_th;
+            float idx =  i_alpha * sin_th + i_beta * cos_th;
+
+            float id = idx;
+            float iq = iqx;
+
+            float erro_we = we_ref_f - we_feedback;
+            z_int_we += erro_we;
+            z_int_id += (0.0f - id);
+
+            float u_mpc_q = -(KX[0][0]*iq + KX[0][1]*id + KX[0][2]*we_feedback)
+                            + KZ[0][0]*z_int_we + KZ[0][1]*z_int_id
+                            + KR[0][0]*we_ref_f;
+
+            float u_mpc_d = -(KX[1][0]*iq + KX[1][1]*id + KX[1][2]*we_feedback)
+                            + KZ[1][0]*z_int_we + KZ[1][1]*z_int_id
+                            + KR[1][0]*we_ref_f;
+
+            float vq_refx = u_mpc_q;
+            float vd_refx = u_mpc_d;
+
+            if (vq_refx > VMAX_MPC){ vq_refx = VMAX_MPC; z_int_we -= erro_we; z_int_id -= -id; }
+            else if (vq_refx < -VMAX_MPC){ vq_refx = -VMAX_MPC; z_int_we -= erro_we; z_int_id -= -id; }
+            if (vd_refx > VMAX_MPC){ vd_refx = VMAX_MPC; z_int_we -= erro_we; z_int_id -= -id; }
+            else if (vd_refx < -VMAX_MPC){ vd_refx = -VMAX_MPC; z_int_we -= erro_we; z_int_id -= -id; }
+
+            vq_ref_ant = vq_refx;
+            vd_ref_ant = vd_refx;
+
+            float valpha_ref = vq_refx * cos_th + vd_refx * sin_th;
+            float vbeta_ref  = -vq_refx * sin_th + vd_refx * cos_th;
+
+            float valfa_norm = valpha_ref / VMAX_MPC;
+            float vbeta_norm = vbeta_ref  / VMAX_MPC;
+
+            uint32_t dac_valfa = (uint32_t)(2048.0f + (valfa_norm * 2047.0f));
+            uint32_t dac_vbeta = (uint32_t)(2048.0f + (vbeta_norm * 2047.0f));
+
+            if(dac_valfa > 4095) dac_valfa = 4095;
+            if(dac_vbeta > 4095) dac_vbeta = 4095;
+
+            saidas_dac[0] = dac_valfa;
+            saidas_dac[1] = dac_vbeta;
+            Atualiza_Sinais_DAC(saidas_dac);
+
+            // ==================================================================
+            // FIM DE TUDO: DESLIGA O PINO (Modo RUN)
+            // ==================================================================
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+
+        } else {
+            // MODO ESPERA
+            static uint32_t contador_led_stop = 0;
+            if(++contador_led_stop >= 1000) {
+                HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                contador_led_stop = 0;
+            }
+            z_int_we = 0.0f; z_int_id = 0.0f; wm_ref_f = 0.0f; vq_ref_ant = 0.0f; vd_ref_ant = 0.0f;
+            saidas_dac[0] = 2048; saidas_dac[1] = 2048;
+            Atualiza_Sinais_DAC(saidas_dac);
+
+            // ==================================================================
+            // FIM DE TUDO: DESLIGA O PINO (Modo ESPERA)
+            // ==================================================================
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+        }
+    }
+}
+
+/* ========================================================================== */
+/* FUNÇÕES SECUNDÁRIAS E CONFIGURAÇÕES GERADAS                                */
+/* ========================================================================== */
+void Leitura_Sensores_HIL(void){
+    extern uint32_t vetor_adc_bruto[6];
+    float v_pino;
+    v_pino = ((float)vetor_adc_bruto[0] / 4095.0f) * 3.3f;
+    hil_w_med = (v_pino - 1.65f) * 60.606060f;
+    v_pino = ((float)vetor_adc_bruto[1] / 4095.0f) * 3.3f;
+    hil_theta_e = (v_pino) * 1.90303f;
+    v_pino = ((float)vetor_adc_bruto[2] / 4095.0f) * 3.3f;
+    hil_wref = (v_pino - 1.65f) * 60.606060f;
+    v_pino = ((float)vetor_adc_bruto[3] / 4095.0f) * 3.3f;
+    hil_ia = (v_pino - 1.65f) * 4.24242424f;
+    v_pino = ((float)vetor_adc_bruto[4] / 4095.0f) * 3.3f;
+    hil_ib = (v_pino - 1.65f) * 4.24242424f;
+    v_pino = ((float)vetor_adc_bruto[5] / 4095.0f) * 3.3f;
+    hil_ic = (v_pino - 1.65f) * 4.24242424f;
+}
+
+void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac){
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, vetor_valores_dac[0]);
+    HAL_DAC_SetValue(&hdac2, DAC_CHANNEL_1, DAC_ALIGN_12B_R, vetor_valores_dac[1]);
+}
+
+void Inicializa_DAC2_Manual(void){
+    __HAL_RCC_DAC2_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    hdac2.Instance = DAC2;
+    HAL_DAC_Init(&hdac2);
+    DAC_ChannelConfTypeDef sConfig = {0};
+    sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+    sConfig.DAC_DMADoubleDataMode = DISABLE;
+    sConfig.DAC_SignedFormat = DISABLE;
+    sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+    sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+    sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+    sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+    sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+    HAL_DAC_ConfigChannel(&hdac2, &sConfig, DAC_CHANNEL_1);
+}
+
+void SystemClock_Config(void){
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK){
+    Error_Handler();
+  }
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)  {
+    Error_Handler();
+  }
+}
+
+static void MX_ADC1_Init(void) {
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 6;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+
+  // SEGREDO PARA FUNCIONAR COM O TIMER: Disparo por software!
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK){
+    Error_Handler();
+  }
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Rank = ADC_REGULAR_RANK_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = ADC_REGULAR_RANK_6;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK){
+    Error_Handler();
+  }
+}
+
+static void MX_CRC_Init(void){
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK){
+    Error_Handler();
+  }
+}
+
+static void MX_DAC1_Init(void){
+  DAC_ChannelConfTypeDef sConfig = {0};
+  hdac1.Instance = DAC1;
+  if (HAL_DAC_Init(&hdac1) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+  sConfig.DAC_DMADoubleDataMode = DISABLE;
+  sConfig.DAC_SignedFormat = DISABLE;
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK){
+    Error_Handler();
+  }
+}
+
+static void MX_DAC2_Init(void){
+  DAC_ChannelConfTypeDef sConfig = {0};
+  hdac2.Instance = DAC2;
+  if (HAL_DAC_Init(&hdac2) != HAL_OK){
+    Error_Handler();
+  }
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+  sConfig.DAC_DMADoubleDataMode = DISABLE;
+  sConfig.DAC_SignedFormat = DISABLE;
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac2, &sConfig, DAC_CHANNEL_1) != HAL_OK){
+    Error_Handler();
+  }
+}
+
+static void MX_TIM1_Init(void){
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 17 - 1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV4;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK){
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK){
+    Error_Handler();
+  }
+}
+
+static void MX_TIM6_Init(void){
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 170 - 1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 99;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK){
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK){
+    Error_Handler();
+  }
+  // Habilita a Interrupção do Timer 6
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+}
+
+static void MX_GPIO_Init(void){
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+
+
+void Error_Handler(void){
+  __disable_irq();
+  while (1){}
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line){}
+#endif /* USE_FULL_ASSERT */
