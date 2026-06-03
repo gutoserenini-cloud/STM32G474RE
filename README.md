@@ -1,0 +1,1 @@
+Para testar este firmware, faça o download do arquivo .zip correspondente ao cenário desejado. Extraia a pasta no seu computador. No STM32CubeIDE, vá em File -> Import -> General -> Existing Projects into Workspace, e selecione a pasta extraída. As configurações de hardware (.ioc) já estão inclusas.
