@@ -613,7 +613,7 @@ void Inicializa_DAC2_Manual(void){
     sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
     HAL_DAC_ConfigChannel(&hdac2, &sConfig, DAC_CHANNEL_1);
 }
-/* USER CODE END 4 *
+/* USER CODE END 4 */
 
 void Error_Handler(void){
   /* USER CODE BEGIN Error_Handler_Debug */
