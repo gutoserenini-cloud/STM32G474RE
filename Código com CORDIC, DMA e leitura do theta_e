@@ -472,9 +472,7 @@ void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac){
 // ==============================================================================
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM6) {
-        // O ADC e o DMA começam a trabalhar fisicamente neste milissegundo
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-        // 2. DISPARA O ADC E O DMA MANUALMENTE
+        // Apenas dispara o ADC e o DMA manualmente.
         HAL_ADC_Start_DMA(&hadc1, (uint32_t*)vetor_adc_bruto, 6);
     }
 }
@@ -484,9 +482,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
     if(hadc->Instance == ADC1) {
 
         // ==============================================================================
-        // 2. DESLIGA O PINO IMEDIATAMENTE (O DMA terminou de preencher o vetor bruto)
+        // INICIO DO CALCULO: Liga o pino PB15 para medir estritamente o tempo da malha
         // ==============================================================================
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
 
         // Verifica o sinal de "Start" do SCADA da Typhoon no Pino PC13
         if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
@@ -519,54 +517,65 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
             float idx =  i_alpha * sin_th + i_beta * cos_th;
             float id = idx;
             float iq = iqx;
+
             // 5. Integração
-            float erro_we = we_ref_f - we_feedback;
-            z_int_we += erro_we;
-            z_int_id += (0.0f - id);
-            // 6. Equações de Ganho do MPC
-            float u_mpc_q = -(KX[0][0]*iq + KX[0][1]*id + KX[0][2]*we_feedback)
-                            + KZ[0][0]*z_int_we + KZ[0][1]*z_int_id
-                            + KR[0][0]*we_ref_f;
-            float u_mpc_d = -(KX[1][0]*iq + KX[1][1]*id + KX[1][2]*we_feedback)
-                            + KZ[1][0]*z_int_we + KZ[1][1]*z_int_id
-                            + KR[1][0]*we_ref_f;
-            // 7. Saturação com Anti-Windup (Back-calculation)
-            float vq_refx = u_mpc_q;
-            float vd_refx = u_mpc_d;
-            if (vq_refx > VMAX_MPC){
-                vq_refx = VMAX_MPC;
-                z_int_we -= erro_we;
-                z_int_id -= -id;
-            } else if (vq_refx < -VMAX_MPC){
-                vq_refx = -VMAX_MPC;
-                z_int_we -= erro_we;
-                z_int_id -= -id;
-            }
-            if (vd_refx > VMAX_MPC){
-                vd_refx = VMAX_MPC;
-                z_int_we -= erro_we;
-                z_int_id -= -id;
-            } else if (vd_refx < -VMAX_MPC){
-                vd_refx = -VMAX_MPC;
-                z_int_we -= erro_we;
-                z_int_id -= -id;
-            }
-            float vq_ref = vq_refx;
-            float vd_ref = vd_refx;
-            vq_ref_ant = vq_ref;
-            vd_ref_ant = vd_ref;
-            // 8. Transformada Inversa e Exportação
-            float valpha_ref = vq_ref * cos_th + vd_ref * sin_th;
-            float vbeta_ref  = -vq_ref * sin_th + vd_ref * cos_th;
-            float valfa_norm = valpha_ref / VMAX_MPC;
-            float vbeta_norm = vbeta_ref  / VMAX_MPC;
-            uint32_t dac_valfa = (uint32_t)(2048.0f + (valfa_norm * 2047.0f));
-            uint32_t dac_vbeta = (uint32_t)(2048.0f + (vbeta_norm * 2047.0f));
-            if(dac_valfa > 4095) dac_valfa = 4095;
-            if(dac_vbeta > 4095) dac_vbeta = 4095;
-            saidas_dac[0] = dac_valfa;
-            saidas_dac[1] = dac_vbeta;
-            Atualiza_Sinais_DAC(saidas_dac);
+			float erro_we = we_ref_f - we_feedback;
+			float erro_id = 0.0f - id;
+
+			z_int_we += erro_we;
+			z_int_id += erro_id;
+
+			// 6. Equações de Ganho do MPC
+			float u_mpc_q = -(KX[0][0]*iq + KX[0][1]*id + KX[0][2]*we_feedback)
+							+ KZ[0][0]*z_int_we + KZ[0][1]*z_int_id
+							+ KR[0][0]*we_ref_f;
+			float u_mpc_d = -(KX[1][0]*iq + KX[1][1]*id + KX[1][2]*we_feedback)
+							+ KZ[1][0]*z_int_we + KZ[1][1]*z_int_id
+							+ KR[1][0]*we_ref_f;
+
+			// 7. Saturação e Anti-Windup Unificado (Evita erro de regime dinâmico)
+			float vq_refx = u_mpc_q;
+			float vd_refx = u_mpc_d;
+			int saturou = 0;
+
+			if (vq_refx > VMAX_MPC){ vq_refx = VMAX_MPC; saturou = 1; }
+			else if (vq_refx < -VMAX_MPC){ vq_refx = -VMAX_MPC; saturou = 1; }
+
+			if (vd_refx > VMAX_MPC){ vd_refx = VMAX_MPC; saturou = 1; }
+			else if (vd_refx < -VMAX_MPC){ vd_refx = -VMAX_MPC; saturou = 1; }
+
+			// Se a máquina saturar a tensão, paralisa a integração para não perder a referência
+			if (saturou == 1) {
+				z_int_we -= erro_we;
+				z_int_id -= erro_id;
+			}
+
+			vq_ref_ant = vq_refx;
+			vd_ref_ant = vd_refx;
+
+			// 8. Transformada Inversa
+			float valpha_ref = vq_refx * cos_th + vd_refx * sin_th;
+			float vbeta_ref  = -vq_refx * sin_th + vd_refx * cos_th;
+
+			float valfa_norm = valpha_ref / VMAX_MPC;
+			float vbeta_norm = vbeta_ref  / VMAX_MPC;
+
+			// 9. PROTEÇÃO DO DAC EM FLOAT (A Bala de Prata contra o Erro de Regime)
+			float dac_a_f = 2048.0f + (valfa_norm * 2047.0f);
+			float dac_b_f = 2048.0f + (vbeta_norm * 2047.0f);
+
+			// Trava absoluta de segurança (Impede o Underflow antes da conversão para inteiro)
+			if (dac_a_f > 4095.0f) dac_a_f = 4095.0f;
+			if (dac_a_f < 0.0f)    dac_a_f = 0.0f;
+
+			if (dac_b_f > 4095.0f) dac_b_f = 4095.0f;
+			if (dac_b_f < 0.0f)    dac_b_f = 0.0f;
+
+			// Atribuição com Valpha e Vbeta em seus devidos eixos
+			saidas_dac[0] = (uint32_t)dac_a_f;
+			saidas_dac[1] = (uint32_t)dac_b_f;
+
+			Atualiza_Sinais_DAC(saidas_dac);
 
         } else {
             // MODO: ESPERA / PARADO (Sinal PC13 em LOW)
@@ -588,6 +597,11 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
             saidas_dac[1] = 2048;
             Atualiza_Sinais_DAC(saidas_dac);
         }
+
+        // ==============================================================================
+        // FIM DO CALCULO: Desliga o pino PB15
+        // ==============================================================================
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
     }
 }
 
