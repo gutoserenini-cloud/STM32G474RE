@@ -65,7 +65,9 @@ void Leitura_Sensores_HIL(void);
 void Atualiza_Sinais_DAC(uint32_t *vetor_valores_dac);
 void Inicializa_DAC2_Manual(void);
 
-// ROTINA PRINCIPAL (MAIN)
+/* ========================================================================== */
+/* ROTINA PRINCIPAL (MAIN)                                                    */
+/* ========================================================================== */
 int main(void){
   HAL_Init();
   SystemClock_Config();
@@ -96,11 +98,15 @@ int main(void){
   }
 }
 
-// INTERRUPÇÃO DO TIMER 6 (Tempo Total: Abordagem Tradicional)
+/* ========================================================================== */
+/* INTERRUPÇÃO DO TIMER 6 (Tempo Total: Abordagem Tradicional)                */
+/* ========================================================================== */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM6) {
 
+        // ==================================================================
         // INÍCIO DE TUDO: LIGA O PINO (Marca zero do tempo de CPU)
+        // ==================================================================
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
 
         // 1. AQUISIÇÃO DO ADC (Polling Bare-Metal)
@@ -184,7 +190,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             saidas_dac[1] = dac_vbeta;
             Atualiza_Sinais_DAC(saidas_dac);
 
+            // ==================================================================
             // FIM DE TUDO: DESLIGA O PINO (Modo RUN)
+            // ==================================================================
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
 
         } else {
@@ -198,7 +206,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             saidas_dac[0] = 2048; saidas_dac[1] = 2048;
             Atualiza_Sinais_DAC(saidas_dac);
 
+            // ==================================================================
             // FIM DE TUDO: DESLIGA O PINO (Modo ESPERA)
+            // ==================================================================
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
         }
     }
@@ -461,6 +471,8 @@ static void MX_GPIO_Init(void){
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 }
+
+
 
 void Error_Handler(void){
   __disable_irq();
